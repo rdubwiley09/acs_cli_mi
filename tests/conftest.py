@@ -8,6 +8,8 @@ from acs_cli.census_api.client import ACS_BASE_URL, MICHIGAN_FIPS
 from acs_cli.places_api.client import PLACES_BASE_URL
 from acs_cli.cms_api.client import HOSPITAL_BASE_URL
 from acs_cli.hrsa_api.client import HRSA_BASE_URL
+from acs_cli.bls_api.client import BLS_BASE_URL, QCEW_BASE_URL
+from acs_cli.hrsa_api.ahrf import AHRF_HP_FILENAME
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -244,3 +246,150 @@ def mock_hrsa():
             )
 
         yield _register
+
+
+# ── BLS helpers ─────────────────────────────────────────────────────────────
+
+MOCK_BLS_FIPS = ["26161", "26163", "26125"]  # Washtenaw, Wayne, Oakland
+
+
+def build_bls_response(
+    series_ids: list[str] | None = None,
+    year: str = "2024",
+    period: str = "M13",
+    status: str = "REQUEST_SUCCEEDED",
+    base_value: float = 5.0,
+) -> dict:
+    """Build a BLS v2 API JSON response."""
+    series_list = []
+    if series_ids is None:
+        series_ids = []
+    for i, sid in enumerate(series_ids):
+        series_list.append({
+            "seriesID": sid,
+            "data": [
+                {
+                    "year": year,
+                    "period": period,
+                    "periodName": "Annual",
+                    "value": str(round(base_value + i * 0.5, 1)),
+                    "footnotes": [{}],
+                }
+            ],
+        })
+    return {
+        "status": status,
+        "responseTime": 100,
+        "message": [],
+        "Results": {
+            "series": series_list,
+        },
+    }
+
+
+@pytest.fixture()
+def bls_api_key(monkeypatch):
+    """Ensure BLS_API_KEY is set."""
+    monkeypatch.setenv("BLS_API_KEY", "test-bls-key-123")
+    return "test-bls-key-123"
+
+
+@pytest.fixture()
+def mock_bls(bls_api_key):
+    """Activate respx and return a helper to register BLS POST mocks."""
+    with respx.mock(assert_all_called=False) as router:
+
+        def _register(
+            response: dict | None = None,
+            status_code: int = 200,
+        ):
+            if response is None and status_code == 200:
+                response = build_bls_response()
+            route = router.post(BLS_BASE_URL).mock(
+                return_value=Response(status_code, json=response or {"status": "REQUEST_FAILED", "Results": {"series": []}, "message": []})
+            )
+            return route
+
+        yield _register
+
+
+# ── QCEW helpers ───────────────────────────────────────────────────────────
+
+QCEW_BASE_URL_PATTERN = "https://data.bls.gov/cew/data/api/"
+
+
+def build_qcew_csv_response(
+    avg_annual_pay: str = "45000",
+    annual_avg_estabs: str = "1200",
+    hc_employment: str = "500",
+    hc_establishments: str = "50",
+) -> str:
+    """Build a QCEW CSV response with the two rows we filter for."""
+    header = "area_fips,own_code,industry_code,agglvl_code,size_code,year,qtr,disclosure_code,annual_avg_estabs,annual_avg_emplvl,total_annual_wages,taxable_annual_wages,annual_contributions,annual_avg_wkly_wage,avg_annual_pay"
+    # Total all-industries row (own=0, ind=10, agg=70)
+    row1 = f"26001,0,10,70,0,2024,A,N,{annual_avg_estabs},5000,225000000,200000000,0,865,{avg_annual_pay}"
+    # Healthcare row (own=5, ind=62, agg=74)
+    row2 = f"26001,5,62,74,0,2024,A,N,{hc_establishments},{hc_employment},20000000,18000000,0,770,38000"
+    # Extra row that should be ignored
+    row3 = "26001,5,44,74,0,2024,A,N,100,200,8000000,7000000,0,600,31000"
+    return header + "\n" + row1 + "\n" + row2 + "\n" + row3 + "\n"
+
+
+@pytest.fixture()
+def mock_qcew():
+    """Activate respx and return a helper to register QCEW GET mocks."""
+    with respx.mock(assert_all_called=False) as router:
+
+        def _register(
+            csv_text: str | None = None,
+            status_code: int = 200,
+        ):
+            if csv_text is None and status_code == 200:
+                csv_text = build_qcew_csv_response()
+            router.get(url__startswith=QCEW_BASE_URL_PATTERN).mock(
+                return_value=Response(
+                    status_code,
+                    text=csv_text or "",
+                    headers={"content-type": "text/csv"},
+                )
+            )
+
+        yield _register
+
+
+# ── AHRF helpers ────────────────────────────────────────────────────────────
+
+
+def build_ahrf_csv_text(
+    pc_physicians: str = "120",
+    total_mds: str = "250",
+    total_dos: str = "80",
+    nps: str = "45",
+    pas: str = "30",
+    dentists: str = "60",
+) -> str:
+    """Build a minimal AHRF hp.csv with Michigan + non-Michigan rows."""
+    header = "fips_st_cnty,phys_nf_prim_care_pc_exc_rsdt_23,md_nf_activ_23,do_nf_activ_23,np_npi_24,pa_npi_24,dent_npi_24"
+    # Michigan rows
+    row1 = f"26161,{pc_physicians},{total_mds},{total_dos},{nps},{pas},{dentists}"  # Washtenaw
+    row2 = f"26163,100,200,60,35,25,50"  # Wayne
+    row3 = f"26125,150,300,90,55,40,70"  # Oakland
+    # Non-Michigan row (should be filtered out)
+    row4 = "36001,200,400,100,60,45,80"  # Albany, NY
+    return header + "\n" + row1 + "\n" + row2 + "\n" + row3 + "\n" + row4 + "\n"
+
+
+@pytest.fixture()
+def mock_ahrf(tmp_path, monkeypatch):
+    """Patch _download_ahrf_csv to write a fake CSV and return its path."""
+    csv_path = tmp_path / AHRF_HP_FILENAME
+    csv_path.write_text(build_ahrf_csv_text())
+
+    def _fake_download(cache_dir=None):
+        return csv_path
+
+    monkeypatch.setattr(
+        "acs_cli.hrsa_api.ahrf._download_ahrf_csv",
+        _fake_download,
+    )
+    return csv_path

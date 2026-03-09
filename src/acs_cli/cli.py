@@ -21,6 +21,21 @@ from acs_cli.census_api.client import (
     save_api_key,
     DEFAULT_YEAR,
 )
+from acs_cli.bls_api import (
+    ECONOMY_MEASURES,
+    QCEW_MEASURES,
+    BLSAPIError,
+    MissingBLSKeyError as MissingBLSKeyError_,
+    fetch_economy_data,
+    fetch_qcew_data,
+    resolve_economy_measures,
+    resolve_qcew_measures,
+    write_economy_csv,
+    write_qcew_csv,
+    get_bls_api_key,
+    save_bls_api_key,
+)
+from acs_cli.bls_api.client import DEFAULT_BLS_YEAR, DEFAULT_PERIOD, DEFAULT_QCEW_YEAR
 from acs_cli.cms_api import (
     ACCESS_MEASURES,
     CMSAPIError,
@@ -32,6 +47,10 @@ from acs_cli.hrsa_api import (
     HRSAAPIError,
     fetch_shortage_data,
     resolve_hpsa_measures,
+    AHRF_MEASURES,
+    fetch_ahrf_data,
+    resolve_ahrf_measures,
+    write_ahrf_csv,
 )
 from acs_cli.places_api import (
     PLACES_MEASURES,
@@ -59,6 +78,14 @@ def _get_key() -> str:
 def _handle_api_error(e: CensusAPIError | InvalidAPIKeyError) -> None:
     typer.echo(f"Error: {e}", err=True)
     raise typer.Exit(1)
+
+
+def _get_bls_key() -> str:
+    try:
+        return get_bls_api_key()
+    except MissingBLSKeyError_ as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -198,6 +225,52 @@ def info(
                     for m in hpsa_measures:
                         val = hr.get(m.measure_id, "")
                         writer.writerow([census_name, f"Shortage: {m.label}", val])
+                    break
+    except Exception:
+        pass
+
+    # Append BLS economy data (best-effort)
+    try:
+        bls_key = get_bls_api_key()
+        econ_measures = resolve_economy_measures(["all"])
+        econ_rows = fetch_economy_data(econ_measures, year=year, api_key=bls_key)
+        for row in matches:
+            census_name = clean_county_name(row.get("NAME", ""))
+            for er in econ_rows:
+                if filt in er.get("county", "").lower():
+                    for m in econ_measures:
+                        val = er.get(m.measure_id, "")
+                        writer.writerow([census_name, f"Economy: {m.label}", val])
+                    break
+    except Exception:
+        pass
+
+    # Append BLS QCEW data (best-effort, no API key needed)
+    try:
+        qcew_measures = resolve_qcew_measures(["all"])
+        qcew_rows = fetch_qcew_data(qcew_measures)
+        for row in matches:
+            census_name = clean_county_name(row.get("NAME", ""))
+            for qr in qcew_rows:
+                if filt in qr.get("county", "").lower():
+                    for m in qcew_measures:
+                        val = qr.get(m.measure_id, "")
+                        writer.writerow([census_name, f"QCEW: {m.label}", val])
+                    break
+    except Exception:
+        pass
+
+    # Append AHRF provider data (best-effort, no API key needed)
+    try:
+        ahrf_measures = resolve_ahrf_measures(["all"])
+        ahrf_rows = fetch_ahrf_data(ahrf_measures)
+        for row in matches:
+            census_name = clean_county_name(row.get("NAME", ""))
+            for ar in ahrf_rows:
+                if filt in ar.get("county", "").lower():
+                    for m in ahrf_measures:
+                        val = ar.get(m.measure_id, "")
+                        writer.writerow([census_name, f"Provider: {m.label}", val])
                     break
     except Exception:
         pass
@@ -355,6 +428,176 @@ def access_cmd(
             typer.echo("No matching rows found.", err=True)
     else:
         count = _write_rows(csv.writer(sys.stdout))
+        if not count:
+            typer.echo("No matching rows found.", err=True)
+
+
+@app.command("bls-login")
+def bls_login(
+    api_key: str = typer.Option(..., prompt="BLS API key", help="Your BLS API key"),
+):
+    """Save your BLS API key. Get one at https://data.bls.gov/registrationEngine/"""
+    path = save_bls_api_key(api_key)
+    typer.echo(f"BLS API key saved to {path}", err=True)
+
+
+@app.command("economy-topics")
+def economy_topics_cmd():
+    """List available economy measure groups and their measures (CSV)."""
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["Group", "Measure ID", "Label", "Description"])
+    for group_name, measures in ECONOMY_MEASURES.items():
+        for m in measures:
+            writer.writerow([group_name, m.measure_id, m.label, m.description])
+
+
+@app.command("economy")
+def economy_cmd(
+    groups: Optional[list[str]] = typer.Argument(None, help="Economy groups (e.g. unemployment employment) or 'all'"),
+    year: int = typer.Option(DEFAULT_BLS_YEAR, "--year", "-y", help="Data year"),
+    county: Optional[str] = typer.Option(None, "--county", "-c", help="Filter by county name substring"),
+    sort: Optional[str] = typer.Option(None, "--sort", "-s", help="Sort descending by measure label"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write CSV to file instead of stdout"),
+    period: str = typer.Option(DEFAULT_PERIOD, "--period", "-p", help="BLS period (M13=annual average, M01-M12=monthly)"),
+):
+    """Query BLS LAUS economic data for Michigan counties (CSV output)."""
+    if not groups:
+        typer.echo(
+            "Error: Provide economy group names or 'all'. Run 'economy-topics' to see available groups.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        measures = resolve_economy_measures(groups)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    api_key = _get_bls_key()
+
+    try:
+        rows = fetch_economy_data(measures, year=year, api_key=api_key, period=period)
+    except BLSAPIError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    if output:
+        with open(output, "w", newline="") as f:
+            w = csv.writer(f)
+            count = write_economy_csv(rows, measures, w, county_filter=county, sort_col=sort)
+        if count:
+            typer.echo(f"Wrote CSV to {output}", err=True)
+        else:
+            typer.echo("No matching rows found.", err=True)
+    else:
+        w = csv.writer(sys.stdout)
+        count = write_economy_csv(rows, measures, w, county_filter=county, sort_col=sort)
+        if not count:
+            typer.echo("No matching rows found.", err=True)
+
+
+@app.command("qcew-topics")
+def qcew_topics_cmd():
+    """List available QCEW measure groups and their measures (CSV)."""
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["Group", "Measure ID", "Label", "Description"])
+    for group_name, measures in QCEW_MEASURES.items():
+        for m in measures:
+            writer.writerow([group_name, m.measure_id, m.label, m.description])
+
+
+@app.command("qcew")
+def qcew_cmd(
+    groups: Optional[list[str]] = typer.Argument(None, help="QCEW groups (e.g. wages healthcare) or 'all'"),
+    year: int = typer.Option(DEFAULT_QCEW_YEAR, "--year", "-y", help="Data year"),
+    county: Optional[str] = typer.Option(None, "--county", "-c", help="Filter by county name substring"),
+    sort: Optional[str] = typer.Option(None, "--sort", "-s", help="Sort descending by measure label"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write CSV to file instead of stdout"),
+):
+    """Query BLS QCEW wage and establishment data for Michigan counties (CSV output)."""
+    if not groups:
+        typer.echo(
+            "Error: Provide QCEW group names or 'all'. Run 'qcew-topics' to see available groups.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        measures = resolve_qcew_measures(groups)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        rows = fetch_qcew_data(measures, year=year)
+    except BLSAPIError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    if output:
+        with open(output, "w", newline="") as f:
+            w = csv.writer(f)
+            count = write_qcew_csv(rows, measures, w, county_filter=county, sort_col=sort)
+        if count:
+            typer.echo(f"Wrote CSV to {output}", err=True)
+        else:
+            typer.echo("No matching rows found.", err=True)
+    else:
+        w = csv.writer(sys.stdout)
+        count = write_qcew_csv(rows, measures, w, county_filter=county, sort_col=sort)
+        if not count:
+            typer.echo("No matching rows found.", err=True)
+
+
+@app.command("provider-topics")
+def provider_topics_cmd():
+    """List available AHRF provider measure groups and their measures (CSV)."""
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["Group", "Measure ID", "Label", "Description"])
+    for group_name, measures in AHRF_MEASURES.items():
+        for m in measures:
+            writer.writerow([group_name, m.measure_id, m.label, m.description])
+
+
+@app.command("providers")
+def providers_cmd(
+    groups: Optional[list[str]] = typer.Argument(None, help="Provider groups (e.g. physicians mid_level dental) or 'all'"),
+    county: Optional[str] = typer.Option(None, "--county", "-c", help="Filter by county name substring"),
+    sort: Optional[str] = typer.Option(None, "--sort", "-s", help="Sort descending by measure label"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write CSV to file instead of stdout"),
+):
+    """Query HRSA AHRF provider counts for Michigan counties (CSV output)."""
+    if not groups:
+        typer.echo(
+            "Error: Provide provider group names or 'all'. Run 'provider-topics' to see available groups.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        measures = resolve_ahrf_measures(groups)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        rows = fetch_ahrf_data(measures)
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+    if output:
+        with open(output, "w", newline="") as f:
+            w = csv.writer(f)
+            count = write_ahrf_csv(rows, measures, w, county_filter=county, sort_col=sort)
+        if count:
+            typer.echo(f"Wrote CSV to {output}", err=True)
+        else:
+            typer.echo("No matching rows found.", err=True)
+    else:
+        w = csv.writer(sys.stdout)
+        count = write_ahrf_csv(rows, measures, w, county_filter=county, sort_col=sort)
         if not count:
             typer.echo("No matching rows found.", err=True)
 
