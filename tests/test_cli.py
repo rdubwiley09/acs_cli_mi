@@ -17,7 +17,7 @@ from acs_cli.census_api.client import (
     resolve_variables,
 )
 from acs_cli.topics import TOPICS
-from tests.conftest import MOCK_COUNTIES, build_census_response, census_url
+from tests.conftest import MOCK_COUNTIES, MOCK_ZCTAS, build_census_response, build_zcta_census_response, census_url
 
 runner = CliRunner()
 
@@ -198,6 +198,112 @@ class TestQueryCommand:
             result = runner.invoke(app, ["query", "age"])
         assert result.exit_code == 1
         assert "API key" in result.stderr
+
+
+# ── zip query command ────────────────────────────────────────────────────
+
+
+class TestZipQuery:
+    @pytest.fixture(autouse=True)
+    def _patch_zctas(self, monkeypatch):
+        """Use a small ZCTA list so tests don't try to batch 993 real ZCTAs."""
+        test_zctas = tuple(code for _, code in MOCK_ZCTAS)
+        monkeypatch.setattr("acs_cli.census_api.client.MI_ZCTAS", test_zctas)
+        monkeypatch.setattr("acs_cli.census_api.zcta.MI_ZCTAS", test_zctas)
+
+    def test_zip_mode_basic(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(codes=codes)
+
+        result = runner.invoke(app, ["query", "age", "--zip"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        header = rows[0]
+        assert header[0] == "Zip Code"
+        assert "Median Age" in header
+        assert len(rows) == 1 + len(MOCK_ZCTAS)
+
+    def test_zip_mode_sorted_by_zcta(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(codes=codes)
+
+        result = runner.invoke(app, ["query", "age", "--zip"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        zcta_codes = [r[0] for r in rows[1:]]
+        assert zcta_codes == sorted(zcta_codes)
+
+    def test_zip_filter(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(codes=codes)
+
+        result = runner.invoke(app, ["query", "age", "--zip", "--county", "481"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        # Only 48103 and 48104 match the "481" substring
+        assert len(rows) == 3  # header + 2
+        for r in rows[1:]:
+            assert r[0].startswith("481")
+
+    def test_zip_filter_no_match(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(codes=codes)
+
+        result = runner.invoke(app, ["query", "age", "--zip", "--county", "99999"])
+        assert "No matching rows" in result.stderr
+
+    def test_zip_sort_option(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        counter = {"n": 0}
+
+        def values_fn(zi, _code):
+            counter["n"] += 1
+            return str(counter["n"] * 10)
+
+        resp = build_zcta_census_response(codes, values_fn=values_fn)
+        mock_census_zcta(codes=codes, response=resp)
+
+        result = runner.invoke(app, ["query", "age", "--zip", "--sort", "Median Age"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        ages = [r[1] for r in rows[1:]]
+        ages_float = [float(a) for a in ages if a]
+        assert ages_float == sorted(ages_float, reverse=True)
+
+    def test_zip_multi_year(self, mock_census_zcta):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(year=2019, codes=codes)
+        mock_census_zcta(year=2023, codes=codes)
+
+        result = runner.invoke(app, ["query", "age", "--zip", "--years", "2019,2023"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        header = rows[0]
+        assert header[0] == "Year"
+        assert header[1] == "Zip Code"
+        assert len(rows) == 1 + len(MOCK_ZCTAS) * 2
+
+    def test_zip_raw_variable(self, mock_census_zcta):
+        mock_census_zcta(codes=["B01003_001E"])
+
+        result = runner.invoke(app, ["query", "--zip", "--variable", "B01003_001E"])
+        assert result.exit_code == 0
+        rows = parse_csv(result.stdout)
+        assert rows[0][0] == "Zip Code"
+
+    def test_zip_output_to_file(self, mock_census_zcta, tmp_path):
+        codes = [v.code for v in TOPICS["age"]]
+        mock_census_zcta(codes=codes)
+
+        outfile = str(tmp_path / "zip_output.csv")
+        result = runner.invoke(app, ["query", "age", "--zip", "--output", outfile])
+        assert result.exit_code == 0
+        assert "Wrote CSV" in result.stderr
+
+        with open(outfile) as f:
+            rows = list(csv.reader(f))
+        assert rows[0][0] == "Zip Code"
+        assert len(rows) == 1 + len(MOCK_ZCTAS)
 
 
 # ── info command ─────────────────────────────────────────────────────────────

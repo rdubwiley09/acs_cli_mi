@@ -9,6 +9,7 @@ import httpx
 from dotenv import load_dotenv
 
 from acs_cli import clean_county_name
+from acs_cli.census_api.zcta import MI_ZCTAS, ZCTA_GEO_BATCH_SIZE
 from acs_cli.topics import TOPICS, Variable
 
 load_dotenv()
@@ -22,6 +23,7 @@ CONFIG_DIR = Path.home() / ".config" / "acs-cli"
 CONFIG_FILE = CONFIG_DIR / "config"
 MAX_VARS_PER_CALL = 49  # Census API allows 50 fields; NAME takes one slot
 SUPPRESSED = {"-666666666", "-666666666.0", "null", "-", "None", None}
+ZCTA_FIELD = "zip code tabulation area"
 
 
 # ── API key management ───────────────────────────────────────────────────────
@@ -67,14 +69,28 @@ class CensusAPIError(Exception):
 
 # ── Data fetching ────────────────────────────────────────────────────────────
 
-def _fetch_acs_batch(codes: list[str], year: int, api_key: str) -> list[dict]:
+def _fetch_acs_batch(
+    codes: list[str],
+    year: int,
+    api_key: str,
+    *,
+    zip_mode: bool = False,
+    zctas: list[str] | None = None,
+) -> list[dict]:
     url = ACS_BASE_URL.format(year=year)
-    params = {
-        "get": f"NAME,{','.join(codes)}",
-        "for": "county:*",
-        "in": f"state:{MICHIGAN_FIPS}",
-        "key": api_key,
-    }
+    if zip_mode and zctas:
+        params: dict[str, str] = {
+            "get": f"NAME,{','.join(codes)}",
+            "for": f"{ZCTA_FIELD}:{','.join(zctas)}",
+            "key": api_key,
+        }
+    else:
+        params = {
+            "get": f"NAME,{','.join(codes)}",
+            "for": "county:*",
+            "in": f"state:{MICHIGAN_FIPS}",
+            "key": api_key,
+        }
     resp = httpx.get(url, params=params, timeout=30)
     if resp.status_code in (401, 403):
         raise InvalidAPIKeyError(
@@ -89,15 +105,36 @@ def _fetch_acs_batch(codes: list[str], year: int, api_key: str) -> list[dict]:
     return [dict(zip(headers, row)) for row in data[1:]]
 
 
-def fetch_acs_data(variables: list[Variable], year: int, api_key: str) -> list[dict]:
+def fetch_acs_data(
+    variables: list[Variable],
+    year: int,
+    api_key: str,
+    *,
+    zip_mode: bool = False,
+) -> list[dict]:
     all_codes = [v.code for v in variables]
-    # Single batch — fast path
-    if len(all_codes) <= MAX_VARS_PER_CALL:
+    var_chunks = [all_codes[i:i + MAX_VARS_PER_CALL] for i in range(0, len(all_codes), MAX_VARS_PER_CALL)]
+
+    if zip_mode:
+        zcta_list = list(MI_ZCTAS)
+        geo_batches = [zcta_list[i:i + ZCTA_GEO_BATCH_SIZE] for i in range(0, len(zcta_list), ZCTA_GEO_BATCH_SIZE)]
+        merged: dict[str, dict] = {}
+        for chunk in var_chunks:
+            for zcta_batch in geo_batches:
+                batch_rows = _fetch_acs_batch(chunk, year, api_key, zip_mode=True, zctas=zcta_batch)
+                for row in batch_rows:
+                    key = row[ZCTA_FIELD]
+                    if key in merged:
+                        merged[key].update(row)
+                    else:
+                        merged[key] = row
+        return list(merged.values())
+
+    # County mode — single geo query
+    if len(var_chunks) == 1:
         return _fetch_acs_batch(all_codes, year, api_key)
-    # Multiple batches — merge on county FIPS (state + county)
-    chunks = [all_codes[i:i + MAX_VARS_PER_CALL] for i in range(0, len(all_codes), MAX_VARS_PER_CALL)]
-    merged: dict[str, dict] = {}
-    for chunk in chunks:
+    merged = {}
+    for chunk in var_chunks:
         batch_rows = _fetch_acs_batch(chunk, year, api_key)
         for row in batch_rows:
             key = row["state"] + row["county"]
@@ -108,10 +145,16 @@ def fetch_acs_data(variables: list[Variable], year: int, api_key: str) -> list[d
     return list(merged.values())
 
 
-def fetch_multi_year(variables: list[Variable], years: list[int], api_key: str) -> list[dict]:
+def fetch_multi_year(
+    variables: list[Variable],
+    years: list[int],
+    api_key: str,
+    *,
+    zip_mode: bool = False,
+) -> list[dict]:
     combined: list[dict] = []
     for year in years:
-        rows = fetch_acs_data(variables, year, api_key)
+        rows = fetch_acs_data(variables, year, api_key, zip_mode=zip_mode)
         for row in rows:
             row["year"] = str(year)
         combined.extend(rows)
@@ -159,12 +202,16 @@ def write_csv(
     county_filter: str | None = None,
     sort_col: str | None = None,
     header: bool = True,
+    zip_mode: bool = False,
 ) -> int:
     """Write rows as CSV. Returns number of data rows written."""
-    # Filter by county substring
+    # Filter by county name or zip code substring
     if county_filter:
         filt = county_filter.lower()
-        rows = [r for r in rows if filt in r.get("NAME", "").lower()]
+        if zip_mode:
+            rows = [r for r in rows if filt in r.get(ZCTA_FIELD, "").lower()]
+        else:
+            rows = [r for r in rows if filt in r.get("NAME", "").lower()]
 
     if not rows:
         return 0
@@ -179,6 +226,8 @@ def write_csv(
         if target_code is None:
             target_code = sort_col
         rows.sort(key=lambda r: float(r.get(target_code, 0) or 0), reverse=True)
+    elif zip_mode:
+        rows.sort(key=lambda r: (r.get(ZCTA_FIELD, ""), r.get("year", "")))
     else:
         rows.sort(key=lambda r: (r.get("NAME", ""), r.get("year", "")))
 
@@ -186,7 +235,7 @@ def write_csv(
     columns: list[str] = []
     if show_year:
         columns.append("Year")
-    columns.append("County")
+    columns.append("Zip Code" if zip_mode else "County")
     for v in variables:
         columns.append(v.label)
 
@@ -198,7 +247,10 @@ def write_csv(
         csv_row: list[str] = []
         if show_year:
             csv_row.append(row.get("year", ""))
-        csv_row.append(clean_county_name(row.get("NAME", "")))
+        if zip_mode:
+            csv_row.append(row.get(ZCTA_FIELD, ""))
+        else:
+            csv_row.append(clean_county_name(row.get("NAME", "")))
         for v in variables:
             csv_row.append(format_value(row.get(v.code), v.format))
         writer.writerow(csv_row)

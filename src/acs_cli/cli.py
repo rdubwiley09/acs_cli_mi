@@ -102,12 +102,13 @@ def query(
     topics: Optional[list[str]] = typer.Argument(None, help="Topic names (e.g. population income) or 'all'"),
     year: int = typer.Option(DEFAULT_YEAR, "--year", "-y", help="Single ACS vintage year"),
     years: Optional[str] = typer.Option(None, "--years", help="Comma-separated years, e.g. '2019,2020,2023' (overrides --year)"),
-    county: Optional[str] = typer.Option(None, "--county", "-c", help="Filter by county name substring"),
+    county: Optional[str] = typer.Option(None, "--county", "-c", help="Filter by county name or zip code substring"),
     sort: Optional[str] = typer.Option(None, "--sort", "-s", help="Sort descending by column label"),
     variable: Optional[list[str]] = typer.Option(None, "--variable", "-v", help="Raw Census variable codes"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Write CSV to this file path instead of stdout"),
+    zip_code: bool = typer.Option(False, "--zip", "-z", help="Query by zip code (ZCTA) instead of county"),
 ):
-    """Query ACS data for Michigan counties. Output is CSV to stdout or a file via --output."""
+    """Query ACS data for Michigan counties (default) or zip codes (--zip). Output is CSV."""
     if not topics and not variable:
         typer.echo("Error: Provide topic names or use --variable / -v.", err=True)
         raise typer.Exit(1)
@@ -122,24 +123,24 @@ def query(
     try:
         if years:
             year_list = [int(y.strip()) for y in years.split(",")]
-            rows = fetch_multi_year(variables, year_list, api_key)
+            rows = fetch_multi_year(variables, year_list, api_key, zip_mode=zip_code)
             show_year = True
         else:
-            rows = fetch_acs_data(variables, year, api_key)
+            rows = fetch_acs_data(variables, year, api_key, zip_mode=zip_code)
     except (InvalidAPIKeyError, CensusAPIError) as e:
         _handle_api_error(e)
 
     if output:
         with open(output, "w", newline="") as f:
             writer = csv.writer(f)
-            count = write_csv(rows, variables, writer, show_year=show_year, county_filter=county, sort_col=sort)
+            count = write_csv(rows, variables, writer, show_year=show_year, county_filter=county, sort_col=sort, zip_mode=zip_code)
         if count:
             typer.echo(f"Wrote CSV to {output}", err=True)
         else:
             typer.echo("No matching rows found.", err=True)
     else:
         writer = csv.writer(sys.stdout)
-        count = write_csv(rows, variables, writer, show_year=show_year, county_filter=county, sort_col=sort)
+        count = write_csv(rows, variables, writer, show_year=show_year, county_filter=county, sort_col=sort, zip_mode=zip_code)
         if not count:
             typer.echo("No matching rows found.", err=True)
 

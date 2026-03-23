@@ -4,7 +4,7 @@ import pytest
 import respx
 from httpx import Response
 
-from acs_cli.census_api.client import ACS_BASE_URL, MICHIGAN_FIPS
+from acs_cli.census_api.client import ACS_BASE_URL, MICHIGAN_FIPS, ZCTA_FIELD
 from acs_cli.places_api.client import PLACES_BASE_URL
 from acs_cli.cms_api.client import HOSPITAL_BASE_URL
 from acs_cli.hrsa_api.client import HRSA_BASE_URL
@@ -93,6 +93,62 @@ def mock_census(api_key):
                 codes = ["B01003_001E"]
             if response is None:
                 response = build_census_response(codes, counties=counties)
+            route = router.get(census_url(year)).mock(
+                return_value=Response(200, json=response)
+            )
+            return route
+
+        yield _register
+
+
+# ── ZCTA helpers ────────────────────────────────────────────────────────
+
+MOCK_ZCTAS = [
+    ("ZCTA5 48103", "48103"),
+    ("ZCTA5 48104", "48104"),
+    ("ZCTA5 49001", "49001"),
+]
+
+
+def build_zcta_census_response(
+    variable_codes: list[str],
+    zctas: list[tuple[str, str]] | None = None,
+    values_fn=None,
+) -> list[list[str]]:
+    """Build a Census API JSON response in ZCTA format (list-of-lists)."""
+    if zctas is None:
+        zctas = MOCK_ZCTAS
+
+    if values_fn is None:
+        counter = {"n": 1000}
+
+        def values_fn(_zi, _code):
+            counter["n"] += 1
+            return str(counter["n"])
+
+    header = ["NAME"] + variable_codes + [ZCTA_FIELD]
+    rows = []
+    for zi, (name, code) in enumerate(zctas):
+        row = [name] + [values_fn(zi, c) for c in variable_codes] + [code]
+        rows.append(row)
+    return [header] + rows
+
+
+@pytest.fixture()
+def mock_census_zcta(api_key):
+    """Activate respx and return a helper to register mock Census ZCTA responses."""
+    with respx.mock(assert_all_called=False) as router:
+
+        def _register(
+            year: int = 2024,
+            codes: list[str] | None = None,
+            response: list[list[str]] | None = None,
+            zctas: list[tuple[str, str]] | None = None,
+        ):
+            if codes is None:
+                codes = ["B01003_001E"]
+            if response is None:
+                response = build_zcta_census_response(codes, zctas=zctas)
             route = router.get(census_url(year)).mock(
                 return_value=Response(200, json=response)
             )
